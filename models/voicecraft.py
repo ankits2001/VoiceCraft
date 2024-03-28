@@ -86,11 +86,19 @@ class VoiceCraft(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = copy.copy(args)
-        self.pattern = DelayedPatternProvider(n_q=self.args.n_codebooks)
-        if not getattr(self.args, "special_first", False):
-            self.args.special_first = 0
-        if not getattr(self.args, "n_special", False):
-            self.args.n_special = 3
+        self.initialize_parameters()
+
+    def initialize_parameters(self):
+        self.handle_special_tokens()
+        self.initialize_embeddings()
+        self.initialize_positional_embeddings()
+        self.initialize_transformer()
+        self.initialize_prediction_layers()
+        self.initialize_accuracy_metrics()
+
+    def handle_special_tokens(self):
+        self.args.special_first = getattr(self.args, "special_first", False)
+        self.args.n_special = getattr(self.args, "n_special", 3)
         self.args.eos = getattr(self.args, "eos", -1)
         self.eog = nn.Parameter(torch.full((self.args.n_codebooks, 1), self.args.eog, dtype=torch.long), requires_grad=False) # [K 1]
         if self.args.eos > 0:
@@ -99,43 +107,36 @@ class VoiceCraft(nn.Module):
         if type(self.args.audio_vocab_size) == str:
             self.args.audio_vocab_size = eval(self.args.audio_vocab_size)
 
-        self.n_text_tokens = self.args.text_vocab_size + 1
-        assert self.args.text_pad_token == self.args.text_vocab_size, f"self.args.text_vocab_size: {self.args.text_vocab_size}, self.args.text_pad_token: {self.args.text_pad_token}"
-
-        self.n_audio_tokens = [self.args.audio_vocab_size + self.args.n_special] * self.args.n_codebooks # special tokens: empty token, EOG token, audio pad token
-        assert self.args.audio_vocab_size == self.args.empty_token, self.args.empty_token
-        assert self.args.eog == self.args.audio_vocab_size + 1, self.args.eog
-        assert self.args.audio_pad_token == self.args.audio_vocab_size + 2, self.args.audio_pad_token
-
+    def initialize_embeddings(self):
         self.text_embedding = TokenEmbedding(
             dim_model=self.args.d_model,
-            vocab_size=self.n_text_tokens, 
+            vocab_size=self.args.text_vocab_size + 1,
             dropout=self.args.text_embedding_dropout
         )
 
-        self.audio_embedding = nn.ModuleList(
-            [
-                TokenEmbedding(
-                dim_model=self.args.audio_embedding_dim, 
-                vocab_size=self.n_audio_tokens[k], 
+        self.audio_embedding = nn.ModuleList([
+            TokenEmbedding(
+                dim_model=self.args.audio_embedding_dim,
+                vocab_size=self.args.audio_vocab_size + self.args.n_special,
                 dropout=self.args.audio_embedding_dropout
-            ) for k in range(self.args.n_codebooks)
-            ]
-        )
-        self.mask_embedding = nn.Parameter(torch.randn(self.args.max_n_spans, self.args.d_model), requires_grad=True)
+            ) for _ in range(self.args.n_codebooks)
+        ])
+
+    def initialize_positional_embeddings(self):
         self.text_positional_embedding = SinePositionalEmbedding(
             self.args.d_model,
             dropout=self.args.text_positional_embedding_dropout,
             scale=False,
-            alpha=True, # learnable scaler, scale the volume of positional embedding
+            alpha=True
         )
         self.audio_positional_embedding = SinePositionalEmbedding(
             self.args.d_model,
             dropout=self.args.audio_positional_embedding_dropout,
             scale=False,
-            alpha=True, # learnable scaler, scale the volume of positional embedding
+            alpha=True
         )
 
+    def initialize_transformer(self):
         dec_layer = TransformerEncoderLayer(
             self.args.d_model,
             self.args.nhead,
@@ -150,22 +151,27 @@ class VoiceCraft(nn.Module):
             num_layers=self.args.num_decoder_layers,
             norm=LayerNorm(self.args.d_model),
         )
-        
-        self.predict_layer = nn.ModuleList(
-            [
-                nn.Sequential(nn.Linear(self.args.d_model, self.args.audio_vocab_size//2), nn.GELU(), nn.Linear(self.args.audio_vocab_size//2, self.n_audio_tokens[k])) for k in range(self.args.n_codebooks)
-            ]
-        )
-        
-        self.accuracy_metrics = nn.ModuleList(
-            [MulticlassAccuracy(
-                self.n_audio_tokens[k],
+
+    def initialize_prediction_layers(self):
+        self.predict_layer = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.args.d_model, self.args.audio_vocab_size // 2),
+                nn.GELU(),
+                nn.Linear(self.args.audio_vocab_size // 2, self.args.audio_vocab_size + self.args.n_special)
+            ) for _ in range(self.args.n_codebooks)
+        ])
+
+    def initialize_accuracy_metrics(self):
+        self.accuracy_metrics = nn.ModuleList([
+            MulticlassAccuracy(
+                self.args.audio_vocab_size + self.args.n_special,
                 top_k=10,
                 average="micro",
                 multidim_average="global",
-                ignore_index=None,
-            ) for k in range(self.args.n_codebooks)]
-        )
+                ignore_index=None
+            ) for _ in range(self.args.n_codebooks)
+        ])
+
 
     
     def prepare_mask_intervals(self, y_lens):
@@ -805,15 +811,16 @@ class VoiceCraft(nn.Module):
                 if len(more_mask_value) > 0:
                     next_mask_ind = more_mask_value.pop(0)
                     mask_emb = self.mask_embedding[next_mask_ind].unsqueeze(0).unsqueeze(0) # [1,1,D]
-                    assert mask_emb.shape == torch.Size((1,1,self.args.d_model)), mask_emb.shape
+                    assert mask_emb.shape == torch.Size((1, 1, self.args.d_model)), mask_emb.shape
+                
                     empty_token = torch.LongTensor([self.args.empty_token]).to(y.device)
-                    empty_emb = torch.stack([
-                        self.audio_embedding[k](empty_token) for k in range(self.args.n_codebooks)], dim=0
-                    ).sum(dim=0, keepdim=True) # [1,1,D]
-                    assert empty_emb.shape == torch.Size((1,1,self.args.d_model)), empty_emb.shape
+                    empty_emb = sum(self.audio_embedding[k](empty_token) for k in range(self.args.n_codebooks)).unsqueeze(0) # [1,1,D]
+                    assert empty_emb.shape == torch.Size((1, 1, self.args.d_model)), empty_emb.shape
+                
                     extra_emb = torch.cat([mask_emb, empty_emb], dim=1) # [1,2,D]
                     samples_emb = torch.cat([samples_emb, extra_emb], dim=1) # [1,3,D] # prev_last_token, mask_token, empty token
-                    assert samples_emb.shape == torch.Size((1,3,self.args.d_model)), f"samples_emb.shape: {samples_emb.shape}"
+                    assert samples_emb.shape == torch.Size((1, 3, self.args.d_model)), f"samples_emb.shape: {samples_emb.shape}"
+
                     ##################### silence repetition handling #####################
                     ##################### silence repetition handling #####################
                     consec_silence_count = 0
